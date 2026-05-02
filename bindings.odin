@@ -1,6 +1,9 @@
 package jsc
 
+import runtime "base:runtime"
 import "core:c"
+import "core:fmt"
+import "core:strings"
 
 // DUMBAI: Mirror all JavaScriptCore C refs as opaque handles for ABI parity.
 JSContextGroupRef :: distinct rawptr
@@ -404,4 +407,125 @@ foreign jsc {
     ContextGroupAddHeapFinalizer :: proc(group: JSContextGroupRef, finalizer: JSHeapFinalizer, userData: rawptr) ---
     ContextGroupRemoveHeapFinalizer :: proc(group: JSContextGroupRef, finalizer: JSHeapFinalizer, userData: rawptr) ---
     ContextGroupAddMarkingConstraint :: proc(group: JSContextGroupRef, constraint: JSMarkingConstraint, userData: rawptr) ---
+}
+
+JSC_RUNTIME_CONSOLE_LOG_SYMBOL :: cstring("__odin_jsc_console_log")
+JSC_RUNTIME_HELPERS_SOURCE_NAME :: cstring("jsc_runtime_helpers.js")
+
+jsc_runtime_has_exception :: proc(exception: ^JSValueRef) -> bool {
+    return exception != nil && exception^ != nil
+}
+
+jsc_runtime_value_to_text :: proc(ctx: JSContextRef, value: JSValueRef, exception: ^JSValueRef) -> (string, bool) {
+    text_value := ValueToStringCopy(ctx, value, exception)
+    if jsc_runtime_has_exception(exception) || text_value == nil {
+        return "", false
+    }
+    defer StringRelease(text_value)
+
+    text_cap := StringGetMaximumUTF8CStringSize(text_value)
+    if text_cap == 0 {
+        return "", true
+    }
+
+    buffer := make([]c.char, int(text_cap), context.temp_allocator)
+    chars_written := StringGetUTF8CString(text_value, raw_data(buffer), text_cap)
+    if chars_written == 0 {
+        return "", true
+    }
+
+    return string(cstring(raw_data(buffer))), true
+}
+
+// DUMBAI: callback sink backs `console.log` for raw JavaScriptCore contexts that otherwise have no host logging bridge.
+jsc_runtime_console_log_callback :: proc "c" (
+    ctx: JSContextRef,
+    function: JSObjectRef,
+    thisObject: JSObjectRef,
+    argumentCount: c.size_t,
+    arguments: [^]JSValueRef,
+    exception: ^JSValueRef,
+) -> JSValueRef {
+    _ = function
+    _ = thisObject
+    context = runtime.default_context()
+
+    if argumentCount == 0 || arguments == nil {
+        fmt.println("")
+        return ValueMakeUndefined(ctx)
+    }
+
+    line := strings.builder_make()
+    for idx := 0; idx < int(argumentCount); idx += 1 {
+        if idx > 0 {
+            strings.write_string(&line, " ")
+        }
+
+        text, ok := jsc_runtime_value_to_text(ctx, arguments[idx], exception)
+        if !ok {
+            if jsc_runtime_has_exception(exception) {
+                return ValueMakeUndefined(ctx)
+            }
+            strings.write_string(&line, "<unprintable>")
+            continue
+        }
+        strings.write_string(&line, text)
+    }
+
+    fmt.println(strings.to_string(line))
+    return ValueMakeUndefined(ctx)
+}
+
+install_console_log_and_require :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) {
+    context = runtime.default_context()
+    if ctx == nil {
+        return
+    }
+
+    global_object := object
+    if global_object == nil {
+        global_object = ContextGetGlobalObject(ctx)
+        if global_object == nil {
+            return
+        }
+    }
+
+    // DUMBAI: install a host-backed logging sink first so bootstrap JS can forward `console.log` output immediately.
+    log_name := StringCreateWithUTF8CString(JSC_RUNTIME_CONSOLE_LOG_SYMBOL)
+    defer StringRelease(log_name)
+    log_fn := ObjectMakeFunctionWithCallback(ctx, log_name, jsc_runtime_console_log_callback)
+    ObjectSetProperty(ctx, global_object, log_name, JSValueRef(log_fn), {}, exception)
+    if jsc_runtime_has_exception(exception) {
+        return
+    }
+
+    bootstrap := strings.builder_make()
+    strings.write_string(&bootstrap, "(function(){const __root=globalThis;")
+    strings.write_string(
+        &bootstrap,
+        "const __console=(typeof __root.console==='object'&&__root.console!==null)?__root.console:(__root.console=Object.create(null));",
+    )
+    strings.write_string(
+        &bootstrap,
+        "if(typeof __console.log!=='function'){__console.log=(...__args)=>{const __sink=__root.__odin_jsc_console_log;if(typeof __sink==='function'){__sink(__args.map((__v)=>String(__v)).join(' '));}};}",
+    )
+    strings.write_string(
+        &bootstrap,
+        "if(typeof __root.require!=='function'){__root.require=(__spec)=>{if(typeof __spec!=='string'){throw new TypeError('require(path) expects a string');}const __trimmed=__spec.trim();if(!__trimmed){throw new Error('require(path) received an empty specifier');}const __normalized=__trimmed.replace(/^\\.\\//,'').replace(/\\.js$/,'').replace(/\\//g,'.');const __parts=__normalized.split('.').filter(Boolean);let __node=__root;for(const __part of __parts){if(__node==null||((typeof __node!=='object')&&(typeof __node!=='function'))||!(__part in __node)){throw new Error(`Cannot require '${__spec}'`);}__node=__node[__part];}return __node;};}",
+    )
+    strings.write_string(&bootstrap, "})();")
+
+    bootstrap_source := strings.to_string(bootstrap)
+    bootstrap_cstr, cerr := strings.clone_to_cstring(bootstrap_source, context.temp_allocator)
+    if cerr != nil {
+        return
+    }
+
+    source_ref := StringCreateWithUTF8CString(bootstrap_cstr)
+    defer StringRelease(source_ref)
+    source_name_ref := StringCreateWithUTF8CString(JSC_RUNTIME_HELPERS_SOURCE_NAME)
+    defer StringRelease(source_name_ref)
+
+    // DUMBAI: run helper bootstrap inside the active global object so every generated binding surface can use `require`.
+    _ = EvaluateScript(ctx, source_ref, nil, source_name_ref, 1, exception)
 }

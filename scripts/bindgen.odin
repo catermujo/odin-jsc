@@ -3438,6 +3438,12 @@ render_helpers_output :: proc(
     write_line(&sb, "    context = runtime.default_context()")
     write_line(
         &sb,
+        "    // DUMBAI: install console/require runtime helpers before namespace registration so generated modules can be loaded via require().",
+    )
+    write_line(&sb, "    jsc.install_console_log_and_require(ctx, object, exception)")
+    write_line(&sb, "    if jsc_has_exception(exception) do return")
+    write_line(
+        &sb,
         fmt.aprintf(
             "    root_key := jsc.StringCreateWithUTF8CString(%s)",
             quote_odin_string(namespace_root),
