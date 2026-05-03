@@ -244,6 +244,75 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     return args, passthrough
 
 
+def _has_cmake_define(passthrough: list[str], define_name: str) -> bool:
+    needle = f"-d{define_name.lower()}="
+    for arg in passthrough:
+        lowered = arg.lower()
+        if not lowered.startswith("--cmakeargs="):
+            continue
+        if needle in lowered:
+            return True
+    return False
+
+
+def _with_windows_cmake_defaults(passthrough: list[str]) -> list[str]:
+    if _host_os() != "Windows":
+        return passthrough
+
+    scoop_clang = (
+        Path.home() / "scoop" / "apps" / "llvm" / "current" / "bin" / "clang-cl.exe"
+    )
+    clang_path = str(scoop_clang) if scoop_clang.exists() else shutil.which("clang-cl")
+    if clang_path is None:
+        return passthrough
+
+    merged = list(passthrough)
+    if not _has_cmake_define(merged, "CMAKE_C_COMPILER"):
+        # DUMBAI: upstream Win port cmake expects clang-cl toolchain semantics
+        # (including compiler-rt builtins), so force compiler selection unless caller overrides it.
+        merged.append(f"--cmakeargs=-DCMAKE_C_COMPILER={clang_path}")
+    if not _has_cmake_define(merged, "CMAKE_CXX_COMPILER"):
+        # DUMBAI: keep C and C++ compiler families aligned to avoid mixed cl/clang-cl
+        # configuration caches that fail during CMake configure.
+        merged.append(f"--cmakeargs=-DCMAKE_CXX_COMPILER={clang_path}")
+    if not _has_cmake_define(merged, "DEVELOPER_MODE_FATAL_WARNINGS"):
+        # DUMBAI: Windows vendor builds are integration artifacts, so keep warnings
+        # non-fatal to avoid churn from upstream warning profile shifts.
+        merged.append("--cmakeargs=-DDEVELOPER_MODE_FATAL_WARNINGS=OFF")
+    if not _has_cmake_define(merged, "VCPKG_MANIFEST_FEATURES"):
+        # DUMBAI: ensure the Win port pulls the full dependency set needed by
+        # OptionsWin.cmake (curl/cairo/woff2/lcms/jpeg-xl) during first configure.
+        merged.append(
+            "--cmakeargs=-DVCPKG_MANIFEST_FEATURES=web;cairo;skia;woff2;lcms;jpeg-xl"
+        )
+    if not _has_cmake_define(merged, "USE_SKIA"):
+        # DUMBAI: default to Cairo path for vendor JSC builds to avoid extra
+        # Skia-only link requirements while still satisfying WebKit win deps.
+        merged.append("--cmakeargs=-DUSE_SKIA=OFF")
+    return merged
+
+
+def _default_windows_build_dir() -> Path:
+    # DUMBAI: keep Windows build output rooted at a short repo-level path so
+    # vcpkg try_compile object paths stay under CMake's 250-char object path limit.
+    return ROOT.parent.parent / "bj"
+
+
+def _with_windows_build_jsc_defaults(command: list[str], passthrough: list[str]) -> list[str]:
+    if _host_os() != "Windows":
+        return command
+
+    if any(
+        flag in passthrough
+        for flag in ("--ftl-jit", "--no-ftl-jit", "--no-ftl-jit-validate", "--ftl-jit-validate")
+    ):
+        return command
+
+    # DUMBAI: default to FTL-on for Windows vendor builds so WebAssembly/B3
+    # type definitions remain available to current upstream JSC source set.
+    return [*command, "--ftl-jit"]
+
+
 def main() -> int:
     args, passthrough = parse_args()
     host = _host_os()
@@ -259,7 +328,13 @@ def main() -> int:
     )
 
     configuration = _normalize_configuration(args.configuration)
-    build_dir = args.build_dir.resolve() if args.build_dir else None
+    if args.build_dir:
+        build_dir = args.build_dir.resolve()
+    elif host == "Windows":
+        build_dir = _default_windows_build_dir()
+    else:
+        build_dir = None
+    passthrough = _with_windows_cmake_defaults(passthrough)
 
     if not args.skip_build:
         command = [
@@ -268,6 +343,7 @@ def main() -> int:
             _as_build_jsc_flag(configuration),
             "--win" if host == "Windows" else "--gtk",
         ]
+        command = _with_windows_build_jsc_defaults(command, passthrough)
         if build_dir is not None:
             command.append(f"--build-dir={build_dir}")
         # DUMBAI: keep passthrough args so callers can inject port-specific cmake flags without editing this script.
