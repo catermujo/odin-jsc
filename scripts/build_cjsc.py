@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import os
 import platform
 import shlex
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 WEBKIT_ROOT = ROOT / "WebKit"
+DEFAULT_WEBKIT_URL = "https://github.com/WebKit/WebKit.git"
+DEFAULT_WEBKIT_BRANCH = "main"
 
 
 def _host_os() -> str:
@@ -20,6 +24,83 @@ def _run(args: list[str], *, cwd: Path) -> None:
     cmd = " ".join(shlex.quote(part) for part in args)
     print(f"[build_cjsc] $ {cmd}  (cwd={cwd})")
     subprocess.run(args, cwd=cwd, check=True)
+
+
+def _remove_tree_force(path: Path) -> None:
+    def _clear_readonly_and_retry(func: object, failed_path: str, _: object) -> None:
+        # DUMBAI: Windows git pack files are often read-only; clear the flag so
+        # interrupted clone trees can be cleaned up automatically.
+        os.chmod(failed_path, stat.S_IWRITE)
+        func(failed_path)
+
+    shutil.rmtree(path, onerror=_clear_readonly_and_retry)
+
+
+def _ensure_webkit_checkout(*, webkit_url: str, webkit_branch: str) -> None:
+    build_jsc_script = WEBKIT_ROOT / "Tools" / "Scripts" / "build-jsc"
+    if WEBKIT_ROOT.exists() and build_jsc_script.exists():
+        return
+
+    if WEBKIT_ROOT.exists() and not build_jsc_script.exists():
+        if (WEBKIT_ROOT / ".git").exists():
+            # DUMBAI: recover interrupted shallow clones in place to avoid
+            # Windows file-lock issues when deleting partially downloaded packs.
+            safe_directory = WEBKIT_ROOT.as_posix()
+            _run(
+                [
+                    "git",
+                    "-c",
+                    f"safe.directory={safe_directory}",
+                    "-C",
+                    str(WEBKIT_ROOT),
+                    "fetch",
+                    "--depth=1",
+                    "--force",
+                    "origin",
+                    webkit_branch,
+                ],
+                cwd=ROOT,
+            )
+            _run(
+                [
+                    "git",
+                    "-c",
+                    f"safe.directory={safe_directory}",
+                    "-C",
+                    str(WEBKIT_ROOT),
+                    "checkout",
+                    "--force",
+                    "FETCH_HEAD",
+                ],
+                cwd=ROOT,
+            )
+            if build_jsc_script.exists():
+                return
+        else:
+            # DUMBAI: non-git partial trees cannot be repaired, so rebuild
+            # from scratch with a clean shallow clone.
+            _remove_tree_force(WEBKIT_ROOT)
+
+    # DUMBAI: auto-bootstrap the vendored WebKit tree so first-time Windows/Linux
+    # builds can run from a clean checkout without manual clone steps.
+    clone_command = [
+        "git",
+        "clone",
+        "--depth=1",
+        "--single-branch",
+        "--branch",
+        webkit_branch,
+        webkit_url,
+        str(WEBKIT_ROOT),
+    ]
+    _run(clone_command, cwd=ROOT)
+
+    if not WEBKIT_ROOT.exists() or not build_jsc_script.exists():
+        msg = (
+            "Expected WebKit checkout after clone is incomplete; missing "
+            f"{build_jsc_script}"
+        )
+        raise FileNotFoundError(msg)
 
 
 def _normalize_configuration(raw: str) -> str:
@@ -143,6 +224,22 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         action="store_true",
         help="Skip invoking build-jsc and only copy artifacts from an existing build tree.",
     )
+    parser.add_argument(
+        "--webkit-url",
+        default=DEFAULT_WEBKIT_URL,
+        help=(
+            "Git URL used when WebKit checkout is missing "
+            f"(default: {DEFAULT_WEBKIT_URL})."
+        ),
+    )
+    parser.add_argument(
+        "--webkit-branch",
+        default=DEFAULT_WEBKIT_BRANCH,
+        help=(
+            "Git branch used when cloning missing WebKit checkout "
+            f"(default: {DEFAULT_WEBKIT_BRANCH})."
+        ),
+    )
     args, passthrough = parser.parse_known_args()
     return args, passthrough
 
@@ -156,12 +253,10 @@ def main() -> int:
         )
         raise RuntimeError(msg)
 
-    if not WEBKIT_ROOT.exists():
-        msg = (
-            "Missing vendored WebKit checkout at "
-            f"{WEBKIT_ROOT}. Clone WebKit there before running this script."
-        )
-        raise FileNotFoundError(msg)
+    _ensure_webkit_checkout(
+        webkit_url=args.webkit_url,
+        webkit_branch=args.webkit_branch,
+    )
 
     configuration = _normalize_configuration(args.configuration)
     build_dir = args.build_dir.resolve() if args.build_dir else None
